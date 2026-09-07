@@ -1,0 +1,28 @@
+# dsh-memory-plugin 组合包层：把记忆体系插件行插入组合。
+# 行按包名引用，Node 模块解析负责找到已安装的代码（见 docs/user/develop/basic/publish）。
+# id 必须与各模块的 `export const name` 一致：index.js=memory-shortterm（L1）、save.js=memory-save（L2 最小切片）、timer.js=memory-timer（P1-4 每日定时载体）。
+#
+# 这一层是自足的：启 L1（跨会话短时记忆）+ memory_save 概念页写入（L2 最小切片）+ memory-timer（每日 02:00
+# 墙钟轮询，P1-4 阶段空跑记 _log.md，P2-1 换真实增量编译），均零外部依赖。memory-timer 的价值在常驻进程（web）；
+# headless 一次性进程也会挂载，靠共享 timer-state.json 与 web 协调（lastRun≥边界则不重复触发）。
+# 想再叠加 L3 语义召回（Memorix MCP）？不要把外部二进制塞进这里——
+# 见 README「可选：叠加 L3 语义召回」，把那段 merge 进你自己 profile 的 patch。
+#
+# 想调旋钮就补 config（全部可选，缺省见 index.js 的 DEFAULTS）：
+#   - id: memory-shortterm
+#     name: dsh-memory-plugin
+#     config:
+#       maxChars: 2048
+#       maxEntries: 50
+#   - id: memory-timer          # 每日编译时刻可配（缺省 02:00 本地墙钟，见 timer.js DEFAULTS）
+#     name: dsh-memory-plugin/timer
+#     config:
+#       hour: 2
+#       minute: 0
+- insert:
+    - id: memory-shortterm
+      name: dsh-memory-plugin
+    - id: memory-save
+      name: dsh-memory-plugin/save
+    - id: memory-timer
+      name: dsh-memory-plugin/timer
