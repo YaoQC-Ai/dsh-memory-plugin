@@ -1,6 +1,35 @@
 # dsh-memory-plugin
 
-Cross-session **short-term memory** (L1) for [DeepSeek-Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Zero dependencies, zero build step — plain Node built-ins and an inlined `UserMessage`.
+> **Give your DeepSeek-Harness a memory that actually sticks.** — 让你的 DSH 真正记住每一次对话，长出一只可用的"长期记忆"。
+
+Every agent *forgets* the moment a session ends. `dsh-memory-plugin` gives
+[DeepSeek-Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) a real
+memory backbone — so the next session picks up right where the last one left off.
+No external services, no build step, no schema to maintain. **Zero dependencies.**
+
+What you get, out of the box:
+
+- 🧠 **Remember across sessions** — each turn is captured and the recent ones are
+  re-injected as background the moment a new session starts (L1 short-term memory).
+- 📚 **Save what matters** — a first-class model tool (`memory_save`) writes durable,
+  self-contained knowledge pages that survive long after the chat ends (L2 write half).
+- ⏰ **Keep it fresh** — a scheduled maintenance task (`memory-timer`) looks after the
+  memory store daily at 02:00, dry-run safe.
+- 🔍 **Optional semantic recall** — layer the official [Memorix MCP memory
+  server](https://github.com/deepseek-ai/deepseek-harness/tree/master/examples/mcp-memory)
+  for true semantic search (L3).
+
+所有 Agent 都会在会话结束那一刻"失忆"。`dsh-memory-plugin` 给 DSH 装上真正的记忆骨架——
+下一个会话能顺接着上一个往下聊。无需外部服务、无需构建、无需维护 schema，**零依赖**。
+
+开箱即得：
+
+- 🧠 **跨会话记忆**（L1）—— 每轮自动捕获，新会话自动召回注入；
+- 📚 **知识沉淀**（L2 写入）—— `memory_save` 模型工具落盘自足的概念页；
+- ⏰ **自动维护**（定时器）—— 每天 02:00 温控记忆仓，dry-run 安全；
+- 🔍 **可选语义召回**（L3）—— 叠加官方 Memorix MCP，做真正的语义搜索。
+
+---
 
 One package, three host plugins (each is a `cordis.patch.yml` row; this README focuses on the L1 plugin and summarizes its siblings):
 
