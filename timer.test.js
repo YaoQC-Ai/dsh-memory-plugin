@@ -46,6 +46,22 @@ test('shouldFire 五态：首装/刚跑过/昨天lastRun/休眠补跑/跑后重�
   assert.equal(shouldFire(new Date(2026, 8, 5, 2, 5, 0).getTime(), new Date(2026, 8, 5, 2, 6, 0), 2, 0), false)
 })
 
+test('禁用 timer 不创建文件、不注册 interval', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-timer-off-'))
+  apply({ interval() { assert.fail('禁用时不得注册') } }, { dir, enabled: false })
+  assert.deepEqual(fs.readdirSync(dir), [])
+})
+
+test('状态替换失败保留旧文件，并清理临时文件', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-timer-atomic-'))
+  const statePath = path.join(dir, 'timer-state.json')
+  writeState(statePath, { lastRun: 'old' })
+  t.mock.method(fs, 'renameSync', () => { throw new Error('rename failed') })
+  assert.throws(() => writeState(statePath, { lastRun: 'new' }), /rename failed/)
+  assert.deepEqual(readState(statePath), { lastRun: 'old' })
+  assert.deepEqual(fs.readdirSync(dir), ['timer-state.json'])
+})
+
 test('state round-trip：writeState→readState 保真；缺失/损坏→{}', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-timer-'))
   const p = path.join(dir, 'memory', 'timer-state.json')

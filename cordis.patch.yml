@@ -4,7 +4,7 @@
 #
 # 这一层是自足的：启 L1（跨会话短时记忆）+ memory_save 概念页写入（L2 最小切片）+ memory-timer（每日 02:00
 # 墙钟轮询，P1-4 阶段空跑记 _log.md，P2-1 换真实增量编译），均零外部依赖。memory-timer 的价值在常驻进程（web）；
-# headless 一次性进程也会挂载，靠共享 timer-state.json 与 web 协调（lastRun≥边界则不重复触发）。
+# 共享状态文件不提供跨进程互斥；仅一个进程启用 timer，其他 profile 配置 enabled: false。
 # 想再叠加 L3 语义召回（Memorix MCP）？不要把外部二进制塞进这里——
 # 见 README「可选：叠加 L3 语义召回」，把那段 merge 进你自己 profile 的 patch。
 #

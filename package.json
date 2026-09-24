@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Three host plugins for DeepSeek-Harness (dsh): L1 cross-session short-term memory (hook-driven capture + recall, zero deps) plus the memory_save tool and a memory-timer maintenance task. / 为 DeepSeek-Harness (dsh) 提供三个宿主插件：L1 跨会话短时记忆（钩子驱动的捕获与召回，零依赖）、memory_save 工具、memory-timer 定时维护任务。",
   "license": "MIT",
   "keywords": [
@@ -28,7 +28,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test.js save.test.js timer.test.js",
+    "test:host": "node host.integration.mjs"
   },
   "dsh": {
     "bundle": {

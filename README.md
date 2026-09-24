@@ -1,35 +1,8 @@
 # dsh-memory-plugin
 
-> **Give your DeepSeek-Harness a memory that actually sticks.** — 让你的 DSH 真正记住每一次对话，长出一只可用的"长期记忆"。
+> v0.1.1：已在 DSH **0.1.5-rc.2**、Node.js 24 验证；不等于已验证所有 DSH 版本。
 
-Every agent *forgets* the moment a session ends. `dsh-memory-plugin` gives
-[DeepSeek-Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) a real
-memory backbone — so the next session picks up right where the last one left off.
-No external services, no build step, no schema to maintain. **Zero dependencies.**
-
-What you get, out of the box:
-
-- 🧠 **Remember across sessions** — each turn is captured and the recent ones are
-  re-injected as background the moment a new session starts (L1 short-term memory).
-- 📚 **Save what matters** — a first-class model tool (`memory_save`) writes durable,
-  self-contained knowledge pages that survive long after the chat ends (L2 write half).
-- ⏰ **Keep it fresh** — a scheduled maintenance task (`memory-timer`) looks after the
-  memory store daily at 02:00, dry-run safe.
-- 🔍 **Optional semantic recall** — layer the official [Memorix MCP memory
-  server](https://github.com/deepseek-ai/deepseek-harness/tree/master/examples/mcp-memory)
-  for true semantic search (L3).
-
-所有 Agent 都会在会话结束那一刻"失忆"。`dsh-memory-plugin` 给 DSH 装上真正的记忆骨架——
-下一个会话能顺接着上一个往下聊。无需外部服务、无需构建、无需维护 schema，**零依赖**。
-
-开箱即得：
-
-- 🧠 **跨会话记忆**（L1）—— 每轮自动捕获，新会话自动召回注入；
-- 📚 **知识沉淀**（L2 写入）—— `memory_save` 模型工具落盘自足的概念页；
-- ⏰ **自动维护**（定时器）—— 每天 02:00 温控记忆仓，dry-run 安全；
-- 🔍 **可选语义召回**（L3）—— 叠加官方 Memorix MCP，做真正的语义搜索。
-
----
+Cross-session **short-term memory** (L1) for [DeepSeek-Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Zero dependencies, zero build step — plain Node built-ins and an inlined `UserMessage`.
 
 One package, three host plugins (each is a `cordis.patch.yml` row; this README focuses on the L1 plugin and summarizes its siblings):
 
@@ -57,19 +30,24 @@ One package, three host plugins (each is a `cordis.patch.yml` row; this README f
 
 Makes an agent *remember what recent sessions talked about* when a new session starts.
 
-- **Capture** — on `agent/turn-stopping`, distills that turn's user + assistant text into a per-session Markdown digest.
-- **Recall** — on `agent/session-start` (any source: `startup | resume | clear | compact`), aggregates the most recent session files and injects them as background context into the first turn.
+- **Capture** — captures `session/event → turn/end` only when `reason.kind === 'completed'`, once per live session turn.
+- **Recall** — on `agent/session-start`, checks existing surface and pending memory before injecting recent digests.
+- **Recover** — restores the accepted current-step messages after compaction, or the rebuilt request during a same-step overflow retry.
 
-That is the whole plugin. It is deliberately **not** an LLM pipeline: capture is rule-based text extraction, so it costs nothing and never blocks a turn.
+Capture is rule-based text extraction: no extra LLM calls. Local file I/O is synchronous; failures are logged. It is not a semantic summarization pipeline.
 
 ### How it works
 
-Two `ctx.on` listeners, no services injected:
+Four business listeners plus disposal cleanup; no services injected:
 
-| Event | Payload used | Action |
-|---|---|---|
-| `agent/session-start` | `{ agent }` | `agent.inject(userMessage(digest))` — synchronous, so it reliably lands in the first turn |
-| `agent/turn-stopping` | `{ agent }` | read `agent.session.snapshotEvents()`, extract this turn, prepend to `<id>.md` |
+| Event | Action |
+|---|---|
+| `agent/session-start` | Deduplicate surface/pending memory, then enqueue recall |
+| `session/event` | Capture the committed completed turn, bounded by its event sequence |
+| `agent/pre-step` | After `next()`, update `decision.messages`, preserve extra fields, settle own pending messages |
+| `agent/request-error` | Outer `prepend` listener: await compaction recovery, append recall only for an uncancelled overflow retry with a newer surface generation |
+
+Empty first steps and rejected steps stay unchanged. Retry recovery does not authorize retries, change the compactor's checkpoint/counts, or add an extra step. Capture deduplication is in-process only; aborted/error/empty turns and historical seed events are not captured. A committed event is not a disk-flush guarantee.
 
 Session-event shapes are asymmetric (verified against `packages/core/session/src/types.ts`):
 
@@ -85,9 +63,8 @@ DSH also injects scaffolding — the workspace `AGENTS.md`, runtime-context snap
 
 ### Install
 
-> Published under the GitHub owner `YaoQC-Ai` (the package `name` is
-> `dsh-memory-plugin`, so `dsh plugin add github:YaoQC-Ai/dsh-memory-plugin` resolves the three
-> plugin rows that reference `dsh-memory-plugin[/save|/timer]`).
+> The package `name` is `dsh-memory-plugin`, so `dsh plugin add github:YaoQC-Ai/dsh-memory-plugin`
+> resolves the three plugin rows that reference `dsh-memory-plugin[/save|/timer]`.
 
 From a git host (pnpm links the checkout; nothing is built):
 
@@ -132,7 +109,7 @@ Every knob is optional; add a `config:` block to the patch row to override.
 
 Evicted turns are not dropped: they roll into `<dir>/memory/shortterm/compile_candidates.md` (a shared aging archive, capped at `maxCandidates`). That file lives beside the per-session digests but is **excluded from recall** — `buildDigest` never reads it, so the archive cannot crowd out real recency or be re-injected as "background". Entry boundaries in both files are `## <ISO timestamp>` lines; Markdown headings like `## foo` inside an assistant reply stay part of their turn and are not split into fake entries.
 
-Per-session files avoid concurrent-write races. These are a **fast digest for injection**, not the source of truth — DSH already persists the full session event log, so trimming old entries loses nothing recoverable.
+Per-session files reduce write collisions, but the shared candidate archive has no cross-process lock. Digests are not the source of truth; retain the host session logs for recovery.
 
 ### Sibling plugins in this package
 
@@ -165,8 +142,12 @@ This exposes `mcp__memorix__*` tools the model can call natively.
 ### Development
 
 ```sh
-node --test    # zero-dependency self-check of the pure logic
+npm test
+# Optional: DSH_SOURCE must point to a built 0.1.5-rc.2 source tree.
+npm run test:host
 ```
+
+The 38 unit tests require no host dependencies. The optional integration harness uses real host drivers with a simulated provider, temporary storage and no network. Tests are included in Git, not in the npm runtime package.
 
 ### License
 
@@ -180,19 +161,24 @@ MIT
 
 让 agent 在新会话开始时「记得」最近若干会话聊过什么。
 
-- **捕获** —— 每轮结束（`agent/turn-stopping`），把这一轮的 user + assistant 文本蒸馏进「按会话 id 分文件」的 Markdown 摘要。
-- **召回** —— 每次会话开始（`agent/session-start`，任何来源：`startup | resume | clear | compact`），聚合最近的会话文件，作为背景注入首轮。
+- **捕获** —— `session/event → turn/end` 且 `reason.kind === 'completed'` 时，按轮次提取 user + assistant 文本，写入会话摘要。
+- **召回** —— `agent/session-start` 检查 surface 与 pending 中是否已有记忆，再注入近期摘要。
+- **恢复** —— 压缩后修正当前步最终消息；溢出压缩后，在同一步重试重建请求前恢复记忆。
 
-这就是插件的全部。它有意**不是**一条 LLM 流水线：捕获是规则化文本提取，零成本、绝不阻塞对话轮次。
+捕获是规则化文本提取，不增加模型调用；本地文件 I/O 是同步的，失败记告警。它不是语义摘要流水线。
 
 ### 工作原理
 
-两个 `ctx.on` 监听器，不注入任何服务：
+四个业务监听器及一个卸载清理监听器，不注入服务：
 
-| 事件 | 用到的 payload | 动作 |
-|---|---|---|
-| `agent/session-start` | `{ agent }` | `agent.inject(userMessage(digest))` —— 同步，稳进首轮 |
-| `agent/turn-stopping` | `{ agent }` | 读 `agent.session.snapshotEvents()`，抽取本轮，prepend 到 `<id>.md` |
+| 事件 | 动作 |
+|---|---|
+| `agent/session-start` | 检查已有记忆，必要时排队召回 |
+| `session/event` | 只捕获已提交的 completed 轮次，用 event.seq 限定快照上界 |
+| `agent/pre-step` | `await next()` 后修正 `decision.messages`，保留扩展字段，清理本插件 pending |
+| `agent/request-error` | `prepend` 外层等待压缩器恢复；仅在溢出 retry、未取消且 surface generation 增加时追加记忆日志 |
+
+空首步、reject 不恢复；后续工具续步不受空首步规则影响。retry 恢复不自行授权重试，不改压缩器计数或 checkpoint，不产生额外 step。去重仅限进程内；取消、错误、空轮次和历史 seed 不捕获。事件提交不代表已经 flush 到磁盘，进程崩溃后的漏捕获不自动补偿。
 
 会话事件形状不对称（已对照 `packages/core/session/src/types.ts` 核对）：
 
@@ -208,9 +194,8 @@ DSH 还会把工作区 `AGENTS.md`、runtime-context 快照、skills 目录这�
 
 ### 安装
 
-> 发布时把下面的 `you` 换成实际 GitHub owner（包 `name` 是 `dsh-memory-plugin`，
-> 所以 `dsh plugin add github:<owner>/dsh-memory-plugin` 能解析引用
-> `dsh-memory-plugin[/save|/timer]` 的三行插件）。
+> 包 `name` 是 `dsh-memory-plugin`，所以 `dsh plugin add github:YaoQC-Ai/dsh-memory-plugin`
+> 能解析引用 `dsh-memory-plugin[/save|/timer]` 的三行插件。
 
 从 git 托管安装（pnpm 链接该 checkout，不跑任何构建）：
 
@@ -255,12 +240,38 @@ dsh --profile <name>
 
 被挤出的轮次不丢弃：滚动进入 `<dir>/memory/shortterm/compile_candidates.md`（全会话共享的老化留档，上限 `maxCandidates`）。它与各会话摘要同目录，但**召回时被排除** —— `buildDigest` 从不读它，所以留档不会挤占「近期性」、也不会被当作「背景」重新注入。两类文件的条目边界都是 `## <ISO 时间戳>` 行；assistant 正文里的 Markdown 标题（如 `## foo`）仍属于本轮，不会被误切成伪条目。
 
-按会话分文件避免并发写竞态。它们是**供注入的快速摘要**，不是事实源 —— DSH 本就持久化完整会话事件日志，所以裁剪旧条目不会丢失任何不可恢复的信息。
+按会话分文件可减少写入冲突，但共享候选池没有跨进程锁。摘要不是事实源，恢复依据仍是宿主保留的完整会话日志。
 
 ### 同包兄弟插件
 
 - **`memory_save`（save.js）** —— 一个模型工具：把自足的概念页写入 `<dir>/memory/knowledge/`（并维护 `<dir>/memory/knowledge/_index.md`）。入参 `title`（概念名）、`content`（自足正文）、`domain`（三选一：`persona` 用户/人格 · `execution` 工作方式 · `knowledge` 其它），写入前校验取值必须属于这三者。这是 L2 的写半边；读/检索半边（`memory_search`）尚未实现。
 - **`memory-timer`（timer.js）** —— 定时维护任务：每个自然日本地时钟 `02:00`（patch 行 `hour`/`minute` 可改）触发一次，默认**只 dry-run**：向 `<dir>/memory/_log.md` 追加触发凭证、状态记入 `<dir>/memory/timer-state.json`，便于先观察节奏再接真实任务；连续失败次数按 `failAlertThreshold` 跟踪告警。它从 base bundle 的 `cordis-plugin-timer` 注入 `timer`（`ctx.interval`）。
+
+### 保存与定时配置（v0.1.1）
+
+- `memory-save.config.wikiDir`：可选绝对路径，优先于 `dir`；未设时仍写 `<dir>/memory/knowledge/`。升级有本机定制路径的安装前，必须显式配置旧落点。
+- 标题含非法字符、Windows 设备名、内部保留页名、尾随点/空格或超过 80 字符时直接拒绝；不靠删除字符或截断来改名。概念页与索引不提供跨文件事务。
+- `memory-timer.config.enabled: false`：完全禁用启动补跑和轮询。只允许一个进程启用 timer，建议 Web 启用，headless 禁用。
+- 同目录临时文件替换可降低状态截断风险，但不是跨进程互斥，也不是 `_log.md` 与状态文件的事务。
+- 整机休眠后，下一次 Web 启动或轮询只补最近一个边界；连续两晚观察须使用新部署后的真实记录。
+
+profile patch 示例（这是两个 profile 各自的片段，不要合并）：
+
+```yaml
+# headless/cordis.patch.yml
+- id: memory-timer
+  config:
+    enabled: false
+```
+
+```yaml
+# web/cordis.patch.yml
+- id: memory-timer
+  config:
+    enabled: true
+```
+
+`wikiDir` 应在两个 profile 中均指向同一个实际绝对路径。patch 会替换整个 config，不是深层合并；保留现有其他配置项。包默认不指定任何用户路径。
 
 ### 可选：叠加 L3 语义召回
 
@@ -288,8 +299,17 @@ L1 提供的是「近期性」，不做语义检索。要语义召回，请把�
 ### 开发
 
 ```sh
-node --test    # 对纯逻辑做零依赖自检
+npm test
 ```
+
+38 项单测无需宿主依赖。可选真实宿主集成测试使用已构建的 0.1.5-rc.2 源码、真实驱动与压缩器、模拟提供方和临时目录，不访问网络：
+
+```powershell
+$env:DSH_SOURCE = '<已构建的宿主源码绝对路径>'
+npm run test:host
+```
+
+测试代码随 Git 发布，不包含在 npm 运行包中。
 
 ### 许可
 

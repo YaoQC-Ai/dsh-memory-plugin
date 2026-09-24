@@ -2,15 +2,15 @@
  * dsh-memory-plugin — L1 短时跨会话记忆（宿主半插件 / host half）
  *
  * 只做一件事：让 agent 在新会话开始时「记得」最近若干会话聊过什么。
- *   捕获 capture —— 每轮结束（agent/turn-stopping），把这一轮的 user+assistant
+ *   捕获 capture —— 已完成轮次（session/event → turn/end），把这一轮的 user+assistant
  *                   文本蒸馏进「按会话 id 分文件」的 Markdown 摘要。
  *   召回 recall  —— 每次会话开始（agent/session-start），聚合最近若干会话文件，
  *                   作为背景注入首轮（agent.inject）。
  *   淘汰 evict   —— 会话文件超过 maxEntries 时，被挤出的更旧轮次转入 compile_candidates.md
  *                   候选池（P1-1 ④）而非直接丢弃（生产 L2 另读完整事件日志，见 appendCandidates 注）。
- *   恢复 recover —— compaction 从 surface 第 0 节点起「头部锚定」压缩，注入在会话最前部的
- *                   背景块必被移出可见 surface；每步（agent/pre-step）检查它是否仍可见，被遮蔽
- *                   则重排（P1-3，对标 agent-instructions 基线恢复；见 apply 内 pre-step 注）。
+ *   恢复 recover —— compaction 可能遮蔽早期背景块；pre-step 修正当前 decision.messages，
+ *                   request-error 外层在压缩成功后直接追加日志供同一步 retry 重建。
+ *                   不使用恢复注入来唤醒新请求；头部 system/message 由宿主保护。
  *
  * 零依赖、零构建：纯 Node 内置模块 + 内联构造 UserMessage。
  * 防召回污染（2026-09-07 修复）：compile_candidates.md 是「滚动淘汰的旧轮次」候选池，与
@@ -62,47 +62,78 @@ export function apply(ctx, config = {}) {
   const assistantMaxChars = num(config.assistantMaxChars, DEFAULTS.assistantMaxChars)
   const maxCandidates = num(config.maxCandidates, DEFAULTS.maxCandidates)
 
-  // 召回：任何来源的 session-start（startup|resume|clear|compact）都注入最近脉络。
+  let active = true
+  ctx.on('dispose', () => { active = false })
+  const captured = new WeakMap()
+  const recall = () => {
+    const digest = buildDigest(root, recentFilesCap, maxChars)
+    return digest ? userMessage(digest, name) : undefined
+  }
+  const pending = (agent) => agent.inbox.nextStep.filter(isMemory)
+  const settle = (agent, messages) => {
+    for (const message of messages) agent.inbox.remove(message.id)
+  }
+
+  // resume 的 inbox 已持久化；启动时同时检查已落 surface 与未消费注入。
   ctx.on('agent/session-start', ({ agent }) => {
     try {
-      const digest = buildDigest(root, recentFilesCap, maxChars)
-      if (digest) agent.inject(userMessage(digest, name))
+      if (memoryPresent(agent)) return
+      const memory = recall()
+      if (memory) agent.inject(memory)
     } catch (err) {
       ctx.logger(name).warn('recall failed: %s', msg(err))
     }
   })
 
-  // 捕获：每轮结束把 user+assistant 文本写进本会话文件（分文件避免并发写竞态）。
-  ctx.on('agent/turn-stopping', ({ agent }) => {
+  // 只捕获已完成轮次；历史 seed 不重发此事件。进程崩溃后的漏捕获不做补偿。
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'turn/end' || event.data.reason.kind !== 'completed') return
+    if ((captured.get(session) ?? -1) >= event.data.turn) return
     try {
-      // 事件在 Session 私有 log 里，公开访问器是 snapshotEvents()（无 .events 属性）。
-      const text = extractTurn(agent.session.snapshotEvents())
-      if (text.trim()) appendEntry(root, sanitize(agent.id), text, maxEntries, assistantMaxChars, maxCandidates)
+      const events = session.snapshotEvents().slice(0, event.seq + 1)
+      const start = events.findLastIndex((ev) => ev.type === 'turn/start' && ev.data.turn === event.data.turn)
+      if (start < 0) return
+      const text = extractTurn(events.slice(start))
+      if (text.trim()) appendEntry(root, sanitize(session.id), text, maxEntries, assistantMaxChars, maxCandidates)
+      captured.set(session, event.data.turn)
     } catch (err) {
       ctx.logger(name).warn('capture failed: %s', msg(err))
     }
   })
 
-  // 恢复（P1-3）：compaction 后重注入 L1 脉络。关键事实（DSH 源码已核，勿凭记忆改）：
-  //   · session-start 的 source='compact' 在 DSH「保留但无发射方」(core/agent/README:179)，
-  //     compaction 不重发 session-start → K10 原设想挂点不存在，改挂 agent/pre-step。
-  //   · compaction-basic 自身就在 agent/pre-step 里 next() 之前跑 compactIfNeeded（head-anchored，
-  //     region.ts selectCompactableRange start=surfaceNodes[0]）；故本钩子在 await next() 之后检查，
-  //     无论注册先后都能看到「已遮蔽」的 surface，同步骤检测、重排到 inbox（下一步生效）。
-  //   · compaction 只遮蔽 surface、不删事件日志 → turn-stopping 的 snapshotEvents 捕获天然免疫，
-  //     且 compactNow 要求 idle（末轮已 turn-stopping 落盘）→ K10 part(a)「flush 未写回合」无必要。
-  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+  // 压缩器跑完后，恢复到当前决定；不把恢复内容留在 nextStep 触发额外请求。
+  ctx.on('agent/pre-step', async ({ agent, step, signal }, next) => {
     const decision = await next()
-    if (decision.kind === 'reject') return decision // 本步不跑模型：无需恢复，留待下个非 reject 步。
+    if (!active || signal?.aborted || decision.kind === 'reject'
+      || (step === 1 && decision.messages.length === 0)) return decision
     try {
-      if (memoryPresent(agent, messages)) return decision // 仍在（surface/inbox/本步已认领）：不动。
-      const digest = buildDigest(root, recentFilesCap, maxChars) // 被遮蔽：重建并排队（每步至多一次，落地即停）。
-      if (digest) agent.inject(userMessage(digest, name))
+      const queued = pending(agent)
+      const memory = memoryPresent(agent, decision.messages, false) ? undefined : queued.at(-1) || recall()
+      settle(agent, queued)
+      if (memory) return { ...decision, messages: [...decision.messages, memory] }
     } catch (err) {
-      ctx.logger(name).warn('re-inject failed: %s', msg(err))
+      ctx.logger(name).warn('restore failed: %s', msg(err))
     }
     return decision
-  })
+  }, { prepend: true })
+
+  // 压缩器成功会短路 waterfall：必须在外层等待它结束，再向日志追加供同一步 retry 重建。
+  ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+    const generation = agent.session.surface.replaceGeneration
+    const action = await next()
+    if (!active || signal.aborted || action?.kind !== 'retry'
+      || failure.code !== 'CONTEXT_WINDOW_EXCEEDED'
+      || !(agent.session.surface.replaceGeneration > generation)) return action
+    try {
+      const queued = pending(agent)
+      const memory = memoryPresent(agent, [], false) ? undefined : queued.at(-1) || recall()
+      if (memory) agent.session.append('user/message', memory, { surfaceOp: 'append' })
+      settle(agent, queued)
+    } catch (err) {
+      ctx.logger(name).warn('retry restore failed: %s', msg(err))
+    }
+    return action // 不授权新重试、不改压缩器计数或 checkpoint。
+  }, { prepend: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +152,7 @@ export function userMessage(text, plugin) {
 
 /**
  * 抽取「当前这一轮」的 user+assistant 文本。
- * 从日志尾部向前扫，遇到 turn/start 即停 —— turn-stopping 触发时尾部就是本轮。
+ * 从已完成事件的快照上界向前扫，遇到 turn/start 即停。
  * 返回按时间正序拼接的多行文本。
  */
 export function extractTurn(events) {
@@ -212,17 +243,20 @@ export function buildDigest(root, recentFilesCap, maxChars) {
  * 查 inbox+messages 是为防 session-start 的注入尚未落 surface 时（首轮）被本钩子重复注入。
  * 纯谓词（导出以便零依赖自检，见 test.js 的 mock agent）。
  */
-export function memoryPresent(agent, claimed) {
-  const isMine = (m) => !!m && m.source && m.source.kind === 'plugin' && m.source.plugin === name
-  if (Array.isArray(claimed) && claimed.some(isMine)) return true
+function isMemory(m) {
+  return m?.source?.kind === 'plugin' && m.source.plugin === name && !!textOf(m.content)
+}
+
+export function memoryPresent(agent, claimed, includePending = true) {
+  if (Array.isArray(claimed) && claimed.some(isMemory)) return true
   const inbox = agent && agent.inbox
-  if (inbox && Array.isArray(inbox.nextStep) && inbox.nextStep.some(isMine)) return true
+  if (includePending && inbox && Array.isArray(inbox.nextStep) && inbox.nextStep.some(isMemory)) return true
   const session = agent && agent.session
   const surface = session && session.surface
   if (surface && Array.isArray(surface.nodes)) {
     for (const seq of surface.nodes) {
       const ev = session.eventAt(seq)
-      if (ev && ev.type === 'user/message' && isMine(ev.data)) return true
+      if (ev && ev.type === 'user/message' && isMemory(ev.data)) return true
     }
   }
   return false
@@ -256,11 +290,9 @@ export function splitEntries(text) {
   if (typeof text !== 'string' || !text.trim()) return []
   const heads = []
   const lines = text.split('\n')
-  let lastHead = -1
   lines.forEach((line, i) => {
     if (ENTRY_HEAD_RE.test(line)) {
       heads.push(i)
-      lastHead = i
     }
   })
   if (!heads.length) return [text]

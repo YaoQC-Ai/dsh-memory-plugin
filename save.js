@@ -33,7 +33,10 @@ const DOMAINS = Object.freeze(['persona', 'execution', 'knowledge'])
 
 export function apply(ctx, config = {}) {
   const home = config.dir || process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-  const knowledgeRoot = path.join(home, 'memory', 'knowledge')
+  if (config.wikiDir !== undefined && (typeof config.wikiDir !== 'string' || !path.isAbsolute(config.wikiDir))) {
+    throw new Error('wikiDir 必须是绝对路径')
+  }
+  const knowledgeRoot = config.wikiDir || path.join(home, 'memory', 'knowledge')
 
   ctx.tools.register({
     name: 'memory_save',
@@ -90,7 +93,7 @@ export function apply(ctx, config = {}) {
 export function validateArgs(args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return ['args 不是对象']
   const v = []
-  if (typeof args.title !== 'string' || !args.title.trim()) v.push('title 必须是非空字符串')
+  try { slugify(args.title) } catch (err) { v.push(err.message) }
   if (typeof args.content !== 'string' || !args.content.trim()) v.push('content 必须是非空字符串')
   if (!DOMAINS.includes(args.domain)) v.push(`domain 必须是 ${DOMAINS.join(' | ')} 之一`)
   if (args.aliases !== undefined && (!Array.isArray(args.aliases) || args.aliases.some((a) => typeof a !== 'string'))) {
@@ -99,10 +102,16 @@ export function validateArgs(args) {
   return v
 }
 
-/** 中文标题 → 安全文件名 slug（保留中文，去非法字符；对齐 03-compile 的 slugify）。 */
+/** 标题必须原样可安全用作文件名和 Wiki 链接；拒绝静默删字/截断造成覆盖。 */
 export function slugify(title) {
-  const s = String(title).replace(/[\\/:*?"<>|#]/g, '').trim()
-  return s.slice(0, 80) || 'untitled'
+  if (typeof title !== 'string' || !title.trim()) throw new Error('title 必须是非空字符串')
+  const s = title.trim()
+  if (s.length > 80 || /[\\/:*?"<>|#\[\]^`\x00-\x1f\x7f]/.test(title) || /[. ]$/.test(title)
+    || /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(s)
+    || /^_(index|log)(?:\.|$)/i.test(s) || /^compile_candidates(?:\.|$)/i.test(s)) {
+    throw new Error('title 含非法字符、过长、尾随点/空格或保留文件名')
+  }
+  return s
 }
 
 /**
@@ -111,7 +120,8 @@ export function slugify(title) {
  */
 export function yamlStr(value) {
   const s = String(value)
-  if (/[:#\[\]{}&*!|>'"%@`,]|^\s|\s$/.test(s)) return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+  if (/[:#\[\]{}&*!|>'"%@`,\\\x00-\x1f\x7f]|^\s|\s$/.test(s)
+    || /^(?:null|true|false|yes|no|on|off|~|[-+]?\d.*)$/i.test(s)) return JSON.stringify(s)
   return s
 }
 
@@ -138,6 +148,8 @@ export function buildConceptPage(args, { sessionId, seq, created, updated }) {
 
 /** 写概念页（已存在则保留原 created、刷新 updated）+ 更新 _index.md；返回 {path,title,created}。 */
 export function saveConceptPage(knowledgeRoot, args, { sessionId, seq }) {
+  const violations = validateArgs(args)
+  if (violations.length) throw new Error(`memory_save 参数无效: ${violations.join('; ')}`)
   const today = new Date().toISOString().slice(0, 10)
   const slug = slugify(args.title)
   const filePath = path.join(knowledgeRoot, `${slug}.md`)
@@ -148,8 +160,8 @@ export function saveConceptPage(knowledgeRoot, args, { sessionId, seq }) {
     isNew = false
     const m = old.match(/^created:\s*(.+)$/m)
     if (m) created = m[1].trim()
-  } catch {
-    // 首次写入：没有旧文件。
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
   }
   fs.mkdirSync(knowledgeRoot, { recursive: true })
   fs.writeFileSync(filePath, buildConceptPage(args, { sessionId, seq, created, updated: today }))
@@ -164,12 +176,13 @@ export function updateIndex(knowledgeRoot, slug, domain, today) {
   let lines
   try {
     lines = fs.readFileSync(indexPath, 'utf8').split('\n')
-  } catch {
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
     lines = [...HEADER]
   }
   const sepIdx = lines.findIndex((l) => l.trim().startsWith('|---'))
   const head = sepIdx >= 0 ? lines.slice(0, sepIdx + 1) : [...HEADER]
-  const rows = (sepIdx >= 0 ? lines.slice(sepIdx + 1) : []).filter((l) => l.trim() && !l.includes(`[[${slug}]]`))
+  const rows = (sepIdx >= 0 ? lines.slice(sepIdx + 1) : []).filter((l) => l.trim() && !l.toLowerCase().includes(`[[${slug.toLowerCase()}]]`))
   rows.push(`| [[${slug}]] | ${domain} | draft | ${today} |`)
   fs.writeFileSync(indexPath, [...head, ...rows].join('\n') + '\n')
 }

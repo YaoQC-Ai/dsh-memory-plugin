@@ -14,6 +14,127 @@ import os from 'node:os'
 import path from 'node:path'
 import { apply, extractTurn, textOf, capEntries, splitCap, splitEntries, userMessage, memoryPresent, buildDigest, CANDIDATES_FILE } from './index.js'
 
+// 把旧文本 fixture 包成宿主真实的完成事件；不把 turn-stopping 当作结束。
+function completed(handlers) {
+  return ({ agent }) => {
+    agent.session.id = agent.id
+    const events = agent.session.snapshotEvents()
+    handlers['session/event'](agent.session, {
+      type: 'turn/end', seq: events.length,
+      data: { turn: events.findLast((ev) => ev.type === 'turn/start').data.turn, reason: { kind: 'completed' } },
+    })
+  }
+}
+
+function fixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-compat-'))
+  const root = path.join(dir, 'memory', 'shortterm')
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'history.md'), '已确认的测试事实')
+  const handlers = {}, options = {}, warnings = []
+  apply({ on: (e, fn, opts) => { handlers[e] = fn; options[e] = opts }, logger: () => ({ warn: (...v) => warnings.push(v) }) }, { dir })
+  const events = []
+  const agent = {
+    inbox: { nextStep: [], remove(id) { this.nextStep = this.nextStep.filter((m) => m.id !== id) } },
+    session: {
+      id: 'compat', surface: { nodes: [], replaceGeneration: 0 },
+      eventAt: (seq) => events[seq], snapshotEvents: () => [...events],
+      append(type, data, opts) {
+        const event = { type, data, seq: events.length }
+        events.push(event)
+        if (opts?.surfaceOp === 'append') this.surface.nodes.push(event.seq)
+        handlers['session/event'](this, event)
+        return event
+      },
+    },
+    inject(m) { this.inbox.nextStep.push(m) },
+  }
+  return { dir, handlers, options, agent, events, warnings }
+}
+
+test('resume 检查 surface 与持久化 inbox，重复启动不增加注入', () => {
+  const { handlers, agent } = fixture()
+  handlers['agent/session-start']({ agent })
+  handlers['agent/session-start']({ agent })
+  assert.equal(agent.inbox.nextStep.length, 1)
+  const memory = agent.inbox.nextStep.pop()
+  agent.session.append('user/message', memory, { surfaceOp: 'append' })
+  handlers['agent/session-start']({ agent })
+  assert.equal(agent.inbox.nextStep.length, 0)
+})
+
+test('pre-step 保留最终决定字段、消费 pending，空首步/reject/取消不恢复', async () => {
+  const { handlers, agent } = fixture()
+  const hook = handlers['agent/pre-step']
+  const memory = userMessage('pending', 'memory-shortterm')
+  const other = userMessage('peer', 'peer')
+  agent.inbox.nextStep.push(memory, other)
+  const empty = { kind: 'enter', messages: [], startsRequestSeries: true }
+  assert.equal(await hook({ agent, step: 1 }, async () => empty), empty)
+  assert.equal(agent.inbox.nextStep.length, 2)
+  const rejected = { kind: 'reject' }
+  assert.equal(await hook({ agent, step: 2 }, async () => rejected), rejected)
+  assert.equal(await hook({ agent, step: 2, signal: { aborted: true } }, async () => empty), empty)
+  const decision = await hook({ agent, step: 2 }, async () => empty)
+  assert.equal(decision.startsRequestSeries, true)
+  assert.deepEqual(decision.messages, [memory])
+  assert.deepEqual(agent.inbox.nextStep, [other])
+  // 下游已放入记忆，应保留该决定，并清理多余 pending。
+  agent.inbox.nextStep.push(memory)
+  assert.equal(await hook({ agent, step: 2 }, async () => decision), decision)
+  assert.deepEqual(agent.inbox.nextStep, [other])
+})
+
+test('turn/end 只捕获 completed 一次，取消/错误/空轮次跳过', () => {
+  const { handlers, agent, dir } = fixture()
+  assert.equal(handlers['agent/turn-stopping'], undefined)
+  const s = agent.session
+  s.append('turn/start', { turn: 1 })
+  s.append('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: '完整轮次' }] })
+  s.append('assistant/message', { message: { content: [{ type: 'text', text: '延长后完成' }] } })
+  const end = s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  handlers['session/event'](s, end)
+  const file = path.join(dir, 'memory', 'shortterm', 'compat.md')
+  const first = fs.readFileSync(file, 'utf8')
+  assert.equal(splitEntries(first).length, 1)
+  assert.match(first, /延长后完成/)
+  let turn = 2
+  for (const kind of ['aborted', 'error', 'blocked', 'max-tokens', 'interrupted']) {
+    s.append('turn/start', { turn })
+    s.append('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: '未完成' }] })
+    s.append('turn/end', { turn: turn++, reason: { kind } })
+  }
+  s.append('turn/start', { turn })
+  s.append('turn/end', { turn, reason: { kind: 'completed' } })
+  assert.equal(fs.readFileSync(file, 'utf8'), first)
+})
+
+test('溢出重试外层恢复日志：保留 action、无 inbox 遗留、不自授权重试', async () => {
+  for (const mode of ['retry', 'terminal', 'no-progress', 'cancel', 'disposed', 'other-code', 'write-error']) {
+    const { handlers, options, agent, warnings } = fixture()
+    const hook = handlers['agent/request-error']
+    assert.equal(options['agent/request-error'].prepend, true)
+    const signal = { aborted: false }
+    const action = mode === 'terminal' ? undefined : { kind: 'retry', peer: true }
+    const memory = userMessage('pending', 'memory-shortterm')
+    agent.inbox.nextStep.push(memory)
+    let calls = 0
+    const result = await hook({ agent, signal, failure: { code: mode === 'other-code' ? 'OTHER' : 'CONTEXT_WINDOW_EXCEEDED' } }, async () => {
+      calls++
+      if (mode !== 'no-progress') agent.session.surface.replaceGeneration++
+      if (mode === 'cancel') signal.aborted = true
+      if (mode === 'disposed') handlers.dispose()
+      if (mode === 'write-error') agent.session.append = () => { throw new Error('disk failure') }
+      return action
+    })
+    assert.equal(calls, 1)
+    assert.equal(result, action)
+    assert.equal(agent.session.surface.nodes.length, mode === 'retry' ? 1 : 0)
+    assert.equal(agent.inbox.nextStep.length, mode === 'retry' ? 0 : 1)
+    assert.equal(warnings.length, mode === 'write-error' ? 1 : 0)
+  }
+})
+
 test('textOf 只保留 text 块并 trim', () => {
   assert.equal(
     textOf([{ type: 'text', text: ' a ' }, { type: 'tool_use' }, { type: 'text', text: 'b' }]),
@@ -138,8 +259,8 @@ test('apply: 正文 Markdown 小标题不导致轮次被误拆/误淘汰（P2-1�
     },
     inject() {},
   })
-  handlers['agent/turn-stopping']({ agent: mkTurn('第一轮提问') })
-  handlers['agent/turn-stopping']({ agent: mkTurn('第二轮提问') })
+  completed(handlers)({ agent: mkTurn('第一轮提问') })
+  completed(handlers)({ agent: mkTurn('第二轮提问') })
 
   const shortterm = path.join(dir, 'memory', 'shortterm')
   const sess = fs.readFileSync(path.join(shortterm, 'sess-MD.md'), 'utf8')
@@ -175,7 +296,7 @@ test('buildDigest 排除 compile_candidates.md 候选池（P1-1 防污染）', (
 // 集成：用假 ctx / 假 agent 跑通 apply 的接线，证明核心价值 ——
 // 「A 会话的一轮被捕获落盘 → 新会话 B（不同 id）启动时把它召回注入」。
 // 全程不碰真实 DSH，只在临时目录做真实文件 IO。
-test('apply: turn-stopping 捕获落盘，session-start 跨会话召回注入', () => {
+test('apply: turn/end 捕获落盘，session-start 跨会话召回注入', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-'))
   const handlers = {}
   const injected = []
@@ -188,7 +309,7 @@ test('apply: turn-stopping 捕获落盘，session-start 跨会话召回注入', 
   apply(ctx, { dir })
 
   assert.equal(typeof handlers['agent/session-start'], 'function', '应注册 session-start 监听')
-  assert.equal(typeof handlers['agent/turn-stopping'], 'function', '应注册 turn-stopping 监听')
+  assert.equal(typeof handlers['session/event'], 'function', '应注册 session/event 监听')
 
   // 会话 A 跑完一轮。
   const agentA = {
@@ -198,18 +319,18 @@ test('apply: turn-stopping 捕获落盘，session-start 跨会话召回注入', 
     session: {
       snapshotEvents: () => [
         { type: 'turn/start', data: { turn: 1 } },
-        { type: 'user/message', data: { content: [{ type: 'text', text: '记住密码是 42' }], source: { kind: 'user' } } },
+        { type: 'user/message', data: { content: [{ type: 'text', text: '测试颜色是紫罗兰' }], source: { kind: 'user' } } },
         { type: 'assistant/message', data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: '好的，记住了' }] } } },
       ],
     },
     inject: (m) => injected.push(m),
   }
-  handlers['agent/turn-stopping']({ agent: agentA })
+  completed(handlers)({ agent: agentA })
 
   const file = path.join(dir, 'memory', 'shortterm', 'sess-A.md')
   assert.ok(fs.existsSync(file), '会话 A 的摘要文件应被写出')
   const body = fs.readFileSync(file, 'utf8')
-  assert.ok(body.includes('记住密码是 42'), '应含用户文本')
+  assert.ok(body.includes('测试颜色是紫罗兰'), '应含用户文本')
   assert.ok(body.includes('好的，记住了'), '应含助手文本')
 
   // 新会话 B（不同 id）启动 → 应把 A 的摘要作为背景注入首轮。
@@ -219,7 +340,7 @@ test('apply: turn-stopping 捕获落盘，session-start 跨会话召回注入', 
   assert.equal(injected.length, 1, 'B 启动应恰好注入一条')
   assert.equal(injected[0].role, 'user')
   assert.equal(injected[0].source.plugin, 'memory-shortterm')
-  assert.ok(injected[0].content[0].text.includes('记住密码是 42'), '跨会话召回应含 A 的内容')
+  assert.ok(injected[0].content[0].text.includes('测试颜色是紫罗兰'), '跨会话召回应含 A 的内容')
 })
 
 // P1-1 ④：会话文件超过 maxEntries 时，被挤出的更旧轮次应转入 compile_candidates.md，而非丢弃。
@@ -239,8 +360,8 @@ test('apply: 滚动淘汰的旧轮次路由到 compile_candidates.md（P1-1 ④�
     },
     inject() {},
   })
-  handlers['agent/turn-stopping']({ agent: mkTurn('第一轮内容') })
-  handlers['agent/turn-stopping']({ agent: mkTurn('第二轮内容') })
+  completed(handlers)({ agent: mkTurn('第一轮内容') })
+  completed(handlers)({ agent: mkTurn('第二轮内容') })
 
   const shortterm = path.join(dir, 'memory', 'shortterm')
   const sess = fs.readFileSync(path.join(shortterm, 'sess-C.md'), 'utf8')
@@ -257,7 +378,7 @@ test('apply: 滚动淘汰的旧轮次路由到 compile_candidates.md（P1-1 ④�
 // P1-3：memoryPresent 纯谓词 —— L1 块在 surface/inbox/本步已认领任一处即视为仍在；
 // compaction 遮蔽后三处皆无 → false（触发重注入）。
 test('memoryPresent 命中三处来源，遮蔽后三处皆无则 false', () => {
-  const mem = { source: { kind: 'plugin', plugin: 'memory-shortterm' } }
+  const mem = userMessage('有效记忆', 'memory-shortterm')
   const other = { source: { kind: 'user' } }
   const summary = { source: { kind: 'compaction' } }
   const agentWith = (nodes, bySeq, inbox) => ({
@@ -285,7 +406,7 @@ test('apply: pre-step 在 L1 块被遮蔽后重注入（P1-3 compaction 恢复�
   assert.equal(typeof handlers['agent/pre-step'], 'function', '应注册 pre-step 监听')
 
   // 先让会话 A 落一轮历史 → digest 非空。
-  handlers['agent/turn-stopping']({ agent: {
+  completed(handlers)({ agent: {
     id: 'sess-A',
     session: { snapshotEvents: () => [
       { type: 'turn/start', data: { turn: 1 } },
@@ -310,10 +431,10 @@ test('apply: pre-step 在 L1 块被遮蔽后重注入（P1-3 compaction 恢复�
     { agent: compactedAgent, messages: [] },
     async () => ({ kind: 'enter', messages: [] }),
   )
-  assert.deepEqual(decision, { kind: 'enter', messages: [] }, 'pre-step 应原样透传 decision')
-  assert.equal(reinjected.length, 1, '被遮蔽后应重注入一条')
-  assert.equal(reinjected[0].source.plugin, 'memory-shortterm')
-  assert.ok(reinjected[0].content[0].text.includes('暗号是紫罗兰'), '重注入应含历史脉络')
+  assert.equal(decision.messages.length, 1, '当前决定应携带恢复记忆')
+  assert.equal(reinjected.length, 0, '恢复不得排队到下一步')
+  assert.equal(decision.messages[0].source.plugin, 'memory-shortterm')
+  assert.ok(decision.messages[0].content[0].text.includes('暗号是紫罗兰'))
 })
 
 // P1-3 幂等：L1 块仍可见（未 compaction）时，pre-step 不得重复注入。
@@ -322,7 +443,7 @@ test('apply: pre-step 在 L1 块仍可见时不重复注入（P1-3 幂等）', a
   const handlers = {}
   const ctx = { on: (e, fn) => { handlers[e] = fn }, logger: () => ({ warn() {}, info() {}, error() {} }) }
   apply(ctx, { dir })
-  handlers['agent/turn-stopping']({ agent: { id: 'sess-A', session: { snapshotEvents: () => [
+  completed(handlers)({ agent: { id: 'sess-A', session: { snapshotEvents: () => [
     { type: 'turn/start', data: { turn: 1 } },
     { type: 'user/message', data: { content: [{ type: 'text', text: '历史内容' }], source: { kind: 'user' } } },
   ] }, inject() {} } })

@@ -22,10 +22,32 @@ test('validateArgs 拒绝残缺/越界，接受合法', () => {
   assert.deepEqual(validateArgs({ title: 'x', content: 'y', domain: 'knowledge', aliases: ['a'] }), [])
 })
 
-test('slugify 去非法字符、保留中文、兜底 untitled', () => {
-  assert.equal(slugify('张三的名字'), '张三的名字')
-  assert.equal(slugify('a/b:c*d?'), 'abcd')
-  assert.equal(slugify('   '), 'untitled')
+test('slugify 保留中文，非法标题拒绝且不破坏页面和索引', () => {
+  assert.equal(slugify('小深的名字'), '小深的名字')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-title-'))
+  saveConceptPage(dir, { title: '合法页', content: '保留', domain: 'knowledge' }, {})
+  const before = fs.readFileSync(path.join(dir, '_index.md'), 'utf8')
+  for (const title of ['', '   ', 'a/b:c*d?', '..', 'end.', 'end ', 'a\nb', 'a\u0000b', 'CON', 'con.txt', 'LPT1', 'COM¹', '_INDEX', '_index.md', '_log', 'compile_candidates', 'a[b]', 'a|b', 'x'.repeat(81)]) {
+    assert.throws(() => slugify(title), undefined, title)
+    assert.throws(() => saveConceptPage(dir, { title, content: '拒绝', domain: 'knowledge' }, {}))
+  }
+  assert.equal(fs.readFileSync(path.join(dir, '_index.md'), 'utf8'), before)
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['_index.md', '合法页.md'].sort())
+})
+
+test('wikiDir 显式绝对目录覆盖默认目录，不依赖 Memorix', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wiki-'))
+  const wikiDir = path.join(dir, 'wiki')
+  let tool
+  const ctx = { tools: { register(def) { tool = def } }, logger: () => ({ info() {} }) }
+  assert.throws(() => apply(ctx, { wikiDir: 'relative' }), /绝对路径/)
+  apply(ctx, { dir, wikiDir })
+  const result = await tool.execute({ title: '显式目录', content: '内容', domain: 'knowledge' }, {})
+  assert.equal(path.dirname(result.path), wikiDir)
+  assert.equal(fs.existsSync(path.join(dir, 'memory')), false)
+  for (const alias of ['true', '2026-09-23', 'a\nb', 'a\\b']) {
+    assert.equal(JSON.parse(yamlStr(alias)), alias)
+  }
 })
 
 test('yamlStr 含破坏性字符则双引号包裹并转义', () => {
@@ -36,17 +58,17 @@ test('yamlStr 含破坏性字符则双引号包裹并转义', () => {
 
 test('buildConceptPage 产出 K8 合规 Frontmatter', () => {
   const page = buildConceptPage(
-    { title: '张三的名字', content: '张三叫 XXX。', domain: 'persona', aliases: ['张三'] },
+    { title: '小深的名字', content: '小深叫 XXX。', domain: 'persona', aliases: ['小深'] },
     { sessionId: 'sess-1', seq: 42, created: '2026-09-05', updated: '2026-09-05' },
   )
   assert.ok(page.startsWith('---\n'))
-  assert.ok(page.includes('title: 张三的名字'))
+  assert.ok(page.includes('title: 小深的名字'))
   assert.ok(page.includes('kind: memory-concept'))
   assert.ok(page.includes('source: [session/sess-1 seq 42]'))
   assert.ok(page.includes('tags: [persona]'))
   assert.ok(page.includes('status: draft'))
-  assert.ok(page.includes('# 张三的名字'))
-  assert.ok(page.includes('张三叫 XXX。'))
+  assert.ok(page.includes('# 小深的名字'))
+  assert.ok(page.includes('小深叫 XXX。'))
 })
 
 test('saveConceptPage 首写 created=true，二写保留原 created、created=false', () => {
@@ -96,7 +118,7 @@ test('apply: 注册 memory_save 工具，execute 校验+落盘概念页', async 
 
   // 合法调用 → 落盘，来源含 session/seq。
   const exec = { agent: { id: 'sess-apply', session: { seq: 7 } } }
-  const res = await registered.execute({ title: '张三的名字', content: '张三叫 XXX。', domain: 'persona' }, exec)
+  const res = await registered.execute({ title: '小深的名字', content: '小深叫 XXX。', domain: 'persona' }, exec)
   assert.equal(res.created, true)
   assert.ok(fs.existsSync(res.path))
   assert.ok(fs.readFileSync(res.path, 'utf8').includes('source: [session/sess-apply seq 7]'))
@@ -104,7 +126,7 @@ test('apply: 注册 memory_save 工具，execute 校验+落盘概念页', async 
   // output.render 产出 ContentBlock。
   const blocks = registered.output.render({}, res)
   assert.equal(blocks[0].type, 'text')
-  assert.ok(blocks[0].text.includes('张三的名字'))
+  assert.ok(blocks[0].text.includes('小深的名字'))
 
   // 非法调用 → 抛错（手动校验守住 raw 注册缺失的自动校验）。
   await assert.rejects(() => registered.execute({ title: '', content: 'x', domain: 'persona' }, exec))

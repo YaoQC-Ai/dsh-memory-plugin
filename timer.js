@@ -16,12 +16,9 @@
  *                ③ 触发后同一天重启不重复（lastRun=今天 02:05 ≥ boundary 今天 02:00）。
  *   补跑 catch-up —— apply 里先同步 tick() 一次，再挂 interval：开机即补跑，不必等首个 pollMs。
  *
- * 状态持久化（K4 修正，2026-09-05）：用 memory root 下极小 JSON 文件 timer-state.json（node:fs），
- *   **不用 ctx.storage.domain** —— 后者 open(spec) 的 spec 需 zod/schemastery schema，必须
- *   import {defineDomain} from '@deepseek-ai/dsh-storage-domain' + import z from '@deepseek-ai/schemastery'，
- *   即引入 DSH 内部包依赖，直接违反本包 §0 v1.1「纯 JS 零依赖、不 import 任何 DSH 内部包」的立身之本
- *   （正是它消灭 N2 版本漂移、让包原样可发 GitHub）。JSON 文件同样 durable、零依赖、人可读、落在 git 记忆仓内。
- *   只存 lastRun + consecutiveFailures（nextRun 由墙钟实时算，更少状态=更少 bug）。
+ * 状态持久化：用 memory root 下的 timer-state.json（node:fs），保持同步、零依赖、人可读。
+ *   同目录临时文件写完后替换；不提供跨进程互斥，也不保证日志与状态的跨文件事务。
+ *   保存 lastRun、结果与失败计数；nextRun 由墙钟实时计算。
  *
  * 失败告警（FR-5.2）：每个 boundary 只尝试一次（lastRun 成功/失败都推进，不做同夜内轮询重试刷屏）；
  *   consecutiveFailures 跨夜累计、成功即清零；达到 failAlertThreshold（默认 2）→ ctx.logger.warn 告警。
@@ -30,6 +27,7 @@
  *   tick 需转 async 并加「重入守卫」（编译可能 >pollMs），此处有意不预建（YAGNI）。
  */
 import fs from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -45,6 +43,8 @@ const DEFAULTS = Object.freeze({
 })
 
 export function apply(ctx, config = {}) {
+  if (config.enabled === false) return
+  // ponytail: 只允许一个进程启用 timer；真实异步编译上线时再引入跨进程互斥。
   const home = config.dir || process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
   const memRoot = path.join(home, 'memory')
   const statePath = path.join(memRoot, 'timer-state.json')
@@ -116,10 +116,16 @@ export function readState(statePath) {
   }
 }
 
-/** 原子-ish 写状态文件（先建目录）；JSON 缩进 2 便于人读/排障。 */
+/** 同目录临时文件替换，写失败不截断旧状态；不等于日志+状态的跨文件事务。 */
 export function writeState(statePath, state) {
   fs.mkdirSync(path.dirname(statePath), { recursive: true })
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n')
+  const temp = `${statePath}.${randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(temp, JSON.stringify(state, null, 2) + '\n', { flag: 'wx' })
+    fs.renameSync(temp, statePath)
+  } finally {
+    if (fs.existsSync(temp)) fs.unlinkSync(temp)
+  }
 }
 
 /**
