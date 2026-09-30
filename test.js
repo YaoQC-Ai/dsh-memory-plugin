@@ -12,16 +12,22 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { apply, extractTurn, textOf, capEntries, splitCap, splitEntries, userMessage, memoryPresent, buildDigest, CANDIDATES_FILE } from './index.js'
+import { apply, extractTurn, turnTextOf, textOf, capEntries, splitCap, splitEntries, userMessage, memoryPresent, buildDigest, CANDIDATES_FILE } from './index.js'
 
-// 把旧文本 fixture 包成宿主真实的完成事件；不把 turn-stopping 当作结束。
+// P2-1 后捕获走 session/event 增量累积：把 mock 会话的事件按序流经处理器，末尾补 completed turn/end，
+// 与线上宿主派发一致（不再依赖捕获路径回扫 snapshotEvents）；不把 turn-stopping 当作结束。
 function completed(handlers) {
   return ({ agent }) => {
     agent.session.id = agent.id
     const events = agent.session.snapshotEvents()
+    let turn = 0
+    for (const ev of events) {
+      if (ev.type === 'turn/start') turn = ev.data.turn
+      handlers['session/event'](agent.session, ev)
+    }
     handlers['session/event'](agent.session, {
       type: 'turn/end', seq: events.length,
-      data: { turn: events.findLast((ev) => ev.type === 'turn/start').data.turn, reason: { kind: 'completed' } },
+      data: { turn, reason: { kind: 'completed' } },
     })
   }
 }
@@ -52,15 +58,28 @@ function fixture() {
   return { dir, handlers, options, agent, events, warnings }
 }
 
-test('resume 检查 surface 与持久化 inbox，重复启动不增加注入', () => {
+test('agent/created 检查 surface 与持久化 inbox，重复启动不增加注入', () => {
   const { handlers, agent } = fixture()
-  handlers['agent/session-start']({ agent })
-  handlers['agent/session-start']({ agent })
+  const created = (source) => handlers['agent/created']({ agent, source })
+  created('startup')
+  created('startup') // inbox 已有注入 → memoryPresent 命中 → 不再注入
   assert.equal(agent.inbox.nextStep.length, 1)
   const memory = agent.inbox.nextStep.pop()
-  agent.session.append('user/message', memory, { surfaceOp: 'append' })
-  handlers['agent/session-start']({ agent })
+  agent.session.append('user/message', memory, { surfaceOp: 'append' }) // 落 surface，session/event 记录 memorySeq
+  created('startup') // surface 仍挂着 trackedSeq → memoryPresent 命中 → 不再注入
   assert.equal(agent.inbox.nextStep.length, 0)
+})
+
+// P0-1：仅在 startup/clear 的会话面召回注入；resume（已持久化旧注入）与 compact（交恢复路径）跳过。
+test('agent/created 仅 startup/clear 注入，resume/compact 跳过（P0-1）', () => {
+  const { handlers, agent } = fixture()
+  for (const source of ['resume', 'compact']) {
+    handlers['agent/created']({ agent, source })
+    assert.equal(agent.inbox.nextStep.length, 0, `${source} 不应注入`)
+  }
+  handlers['agent/created']({ agent, source: 'clear' })
+  assert.equal(agent.inbox.nextStep.length, 1, 'clear 应注入')
+  assert.equal(agent.inbox.nextStep[0].source.form, 'recall', '注入应带 form:recall（P1-1）')
 })
 
 test('pre-step 保留最终决定字段、消费 pending，空首步/reject/取消不恢复', async () => {
@@ -110,7 +129,7 @@ test('turn/end 只捕获 completed 一次，取消/错误/空轮次跳过', () =
 })
 
 test('溢出重试外层恢复日志：保留 action、无 inbox 遗留、不自授权重试', async () => {
-  for (const mode of ['retry', 'terminal', 'no-progress', 'cancel', 'disposed', 'other-code', 'write-error']) {
+  for (const mode of ['retry', 'terminal', 'no-progress', 'cancel', 'other-code', 'write-error']) {
     const { handlers, options, agent, warnings } = fixture()
     const hook = handlers['agent/request-error']
     assert.equal(options['agent/request-error'].prepend, true)
@@ -123,7 +142,6 @@ test('溢出重试外层恢复日志：保留 action、无 inbox 遗留、不自
       calls++
       if (mode !== 'no-progress') agent.session.surface.replaceGeneration++
       if (mode === 'cancel') signal.aborted = true
-      if (mode === 'disposed') handlers.dispose()
       if (mode === 'write-error') agent.session.append = () => { throw new Error('disk failure') }
       return action
     })
@@ -178,16 +196,26 @@ test('extractTurn 过滤注入脚手架：只收 source.kind==="user" 的 user/m
     { type: 'user/message', data: { content: [{ type: 'text', text: 'AGENTS.md 样板' }], source: { kind: 'agent-instructions' } } },
     { type: 'user/message', data: { content: [{ type: 'text', text: 'skills 目录' }], source: { kind: 'skill-catalog' } } },
     { type: 'user/message', data: { content: [{ type: 'text', text: '插件注入' }], source: { kind: 'plugin', plugin: 'x' } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: 'V4 插件注入' }], source: { kind: 'plugin:memory-shortterm' } } },
     { type: 'assistant/message', data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: '回答' }] } } },
   ]
   assert.equal(extractTurn(events), '[user] 真实提问\n[assistant] 回答')
+})
+
+// P2-1：增量捕获与 extractTurn 共用 turnTextOf —— 单事件贡献判定（白名单 kind==='user' + 解包 assistant.message）。
+test('turnTextOf 单事件贡献：真实用户轮/助手文本，脚手架与残缺事件为空', () => {
+  assert.equal(turnTextOf({ type: 'user/message', data: { content: [{ type: 'text', text: ' hi ' }], source: { kind: 'user' } } }), '[user] hi')
+  assert.equal(turnTextOf({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'yo' }] } } }), '[assistant] yo')
+  assert.equal(turnTextOf({ type: 'user/message', data: { content: [{ type: 'text', text: 'x' }], source: { kind: 'agent-instructions' } } }), '')
+  assert.equal(turnTextOf({ type: 'turn/start', data: { turn: 1 } }), '')
+  assert.equal(turnTextOf(null), '')
 })
 
 test('userMessage 形状符合 DSH 内联契约且被冻结', () => {
   const m = userMessage('x', 'memory-shortterm')
   assert.equal(m.role, 'user')
   assert.deepEqual(m.content, [{ type: 'text', text: 'x' }])
-  assert.deepEqual(m.source, { kind: 'plugin', plugin: 'memory-shortterm' })
+  assert.deepEqual(m.source, { kind: 'plugin:memory-shortterm', form: 'recall' })
   assert.match(m.id, /^[0-9a-f-]{36}$/)
   assert.notEqual(userMessage('x', 'p').id, m.id) // 每条新 id
   assert.throws(() => {
@@ -308,7 +336,7 @@ test('apply: turn/end 捕获落盘，session-start 跨会话召回注入', () =>
   }
   apply(ctx, { dir })
 
-  assert.equal(typeof handlers['agent/session-start'], 'function', '应注册 session-start 监听')
+  assert.equal(typeof handlers['agent/created'], 'function', '应注册 agent/created 监听')
   assert.equal(typeof handlers['session/event'], 'function', '应注册 session/event 监听')
 
   // 会话 A 跑完一轮。
@@ -335,11 +363,12 @@ test('apply: turn/end 捕获落盘，session-start 跨会话召回注入', () =>
 
   // 新会话 B（不同 id）启动 → 应把 A 的摘要作为背景注入首轮。
   const agentB = { id: 'sess-B', session: { snapshotEvents: () => [] }, inject: (m) => injected.push(m) }
-  handlers['agent/session-start']({ agent: agentB })
+  handlers['agent/created']({ agent: agentB, source: 'startup' })
 
   assert.equal(injected.length, 1, 'B 启动应恰好注入一条')
   assert.equal(injected[0].role, 'user')
-  assert.equal(injected[0].source.plugin, 'memory-shortterm')
+  assert.equal(injected[0].source.kind, 'plugin:memory-shortterm')
+  assert.equal(injected[0].source.form, 'recall', 'P1-1：注入应带 form:recall（UI 渲染成上下文召回行）')
   assert.ok(injected[0].content[0].text.includes('测试颜色是紫罗兰'), '跨会话召回应含 A 的内容')
 })
 
@@ -375,26 +404,28 @@ test('apply: 滚动淘汰的旧轮次路由到 compile_candidates.md（P1-1 ④�
   assert.ok(/## \d{4}-\d{2}-\d{2}T/.test(cand), '候选块应保留 ## <ISO 时间> 头（clean_candidates.py 按此分块）')
 })
 
+test('memoryPresent 仍认得升级前的旧注入形状（kind:plugin + plugin 字段）', () => {
+  const legacy = { id: 'x', role: 'user', content: [{ type: 'text', text: '旧脉络' }], source: { kind: 'plugin', plugin: 'memory-shortterm' } }
+  const agent = { inbox: { nextStep: [legacy] }, session: { surface: { nodes: [] }, eventAt: () => undefined } }
+  assert.equal(memoryPresent(agent, []), true)
+})
+
 // P1-3：memoryPresent 纯谓词 —— L1 块在 surface/inbox/本步已认领任一处即视为仍在；
 // compaction 遮蔽后三处皆无 → false（触发重注入）。
-test('memoryPresent 命中三处来源，遮蔽后三处皆无则 false', () => {
+test('memoryPresent 命中三处来源，遮蔽后三处皆无则 false（P2-1 trackedSeq）', () => {
   const mem = userMessage('有效记忆', 'memory-shortterm')
-  const other = { source: { kind: 'user' } }
-  const summary = { source: { kind: 'compaction' } }
-  const agentWith = (nodes, bySeq, inbox) => ({
-    inbox: { nextStep: inbox || [] },
-    session: { surface: { nodes }, eventAt: (s) => bySeq[s] },
-  })
-  // surface 已落
-  assert.equal(memoryPresent(agentWith([1], { 1: { type: 'user/message', data: mem } }), []), true)
+  const agentWith = (nodes, inbox) => ({ inbox: { nextStep: inbox || [] }, session: { surface: { nodes } } })
+  // surface 仍挂着追踪到的注入块 seq
+  assert.equal(memoryPresent(agentWith([1, 5]), [], true, 5), true)
   // inbox 待认领（防首轮重复注入）
-  assert.equal(memoryPresent(agentWith([], {}, [mem]), []), true)
+  assert.equal(memoryPresent(agentWith([], [mem]), [], true), true)
   // 本步已认领 messages
-  assert.equal(memoryPresent(agentWith([], {}), [mem]), true)
-  // compaction 遮蔽：surface 只剩摘要节点 + 本步是其他消息 → false
-  assert.equal(memoryPresent(agentWith([1], { 1: { type: 'user/message', data: summary } }), [other]), false)
-  // 空 surface / 空 agent 边界
-  assert.equal(memoryPresent(agentWith([], {}), []), false)
+  assert.equal(memoryPresent(agentWith([], []), [mem], false), true)
+  // compaction 遮蔽：追踪的 seq 已不在 surface.nodes → false（触发重注入）
+  assert.equal(memoryPresent(agentWith([9]), [], true, 5), false)
+  // 无追踪 seq（尚未记录注入）/ 空 surface 边界 → false
+  assert.equal(memoryPresent(agentWith([5]), [], true), false)
+  assert.equal(memoryPresent(agentWith([], []), [], true), false)
 })
 
 // P1-3 集成：compaction 把 L1 块移出 surface 后，pre-step 应重建并重注入脉络。
@@ -433,32 +464,20 @@ test('apply: pre-step 在 L1 块被遮蔽后重注入（P1-3 compaction 恢复�
   )
   assert.equal(decision.messages.length, 1, '当前决定应携带恢复记忆')
   assert.equal(reinjected.length, 0, '恢复不得排队到下一步')
-  assert.equal(decision.messages[0].source.plugin, 'memory-shortterm')
+  assert.equal(decision.messages[0].source.kind, 'plugin:memory-shortterm')
   assert.ok(decision.messages[0].content[0].text.includes('暗号是紫罗兰'))
 })
 
-// P1-3 幂等：L1 块仍可见（未 compaction）时，pre-step 不得重复注入。
+// P1-3 幂等：L1 块仍挂在 surface（trackedSeq 命中 surface.nodes）时，pre-step 不得再往 decision.messages 追加。
 test('apply: pre-step 在 L1 块仍可见时不重复注入（P1-3 幂等）', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-idem-'))
-  const handlers = {}
-  const ctx = { on: (e, fn) => { handlers[e] = fn }, logger: () => ({ warn() {}, info() {}, error() {} }) }
-  apply(ctx, { dir })
-  completed(handlers)({ agent: { id: 'sess-A', session: { snapshotEvents: () => [
-    { type: 'turn/start', data: { turn: 1 } },
-    { type: 'user/message', data: { content: [{ type: 'text', text: '历史内容' }], source: { kind: 'user' } } },
-  ] }, inject() {} } })
-
-  const reinjected = []
-  const healthyAgent = {
-    inbox: { nextStep: [] },
-    session: {
-      surface: { nodes: [1] },
-      eventAt: () => ({ type: 'user/message', data: { content: [{ type: 'text', text: '脉络' }], source: { kind: 'plugin', plugin: 'memory-shortterm' } } }),
-    },
-    inject: (m) => reinjected.push(m),
-  }
-  await handlers['agent/pre-step']({ agent: healthyAgent, messages: [] }, async () => ({ kind: 'enter', messages: [] }))
-  assert.equal(reinjected.length, 0, 'L1 块仍可见时不应重注入')
+  const { handlers, agent } = fixture() // root 有 history.md → digest 非空（若误注入 decision.messages 会 +1）
+  // 让一条 L1 注入块经 append 落 surface：session/event 记录 memorySeq，surface.nodes 挂上其 seq。
+  agent.session.append('user/message', userMessage('脉络', 'memory-shortterm'), { surfaceOp: 'append' })
+  const decision = await handlers['agent/pre-step'](
+    { agent, step: 2 },
+    async () => ({ kind: 'enter', messages: [] }),
+  )
+  assert.equal(decision.messages.length, 0, 'L1 块仍挂 surface 时不应重注入')
 })
 
 // P1-3：reject 步不跑模型 → 不注入（也验证 reject 决策被透传）。

@@ -1,6 +1,10 @@
 # dsh-memory-plugin
 
-> v0.1.1：已在 DSH **0.1.5-rc.2**、Node.js 24 验证；不等于已验证所有 DSH 版本。
+> v0.2.0：面向 DSH **≥0.2.0**（在 **0.2.0-rc.1**、Node.js 24 验证）；不等于已验证所有 DSH 版本。0.1.x 旧宿主不再支持。
+
+> 0.2.0: recall injection moved off the removed `agent/session-start` onto `agent/created` (injecting only on `source: startup | clear`, and carrying `source.form: 'recall'` for the UI's context-recall rendering); capture now accumulates per-turn text from `session/event` instead of the deprecated `snapshotEvents()`/`eventAt()` reads; and a `peerDependencies` gate on `@deepseek-ai/dsh ^0.2.0-rc.1` makes an incompatible host skip this bundle at boot instead of failing every turn mid-conversation. The producer-owned `plugin:memory-shortterm` source kind and recognition of pre-0.2 rows are unchanged.
+
+> 0.2.0：召回注入从已删除的 `agent/session-start` 迁到 `agent/created`（仅在 `source: startup | clear` 时注入，并带 `source.form: 'recall'` 以走 UI 的上下文召回渲染）；捕获改为从 `session/event` 增量累积本轮文本，不再用已废弃的 `snapshotEvents()`/`eventAt()` 回扫；新增对 `@deepseek-ai/dsh ^0.2.0-rc.1` 的 `peerDependencies` 闸门，使不兼容宿主在 boot 期跳过本组合包，而非每个回合在对话中途失败。生产者自有的 `plugin:memory-shortterm` kind 与对 0.2 之前旧行的识别保持不变。
 
 Cross-session **short-term memory** (L1) for [DeepSeek-Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Zero dependencies, zero build step — plain Node built-ins and an inlined `UserMessage`.
 
@@ -31,19 +35,19 @@ One package, three host plugins (each is a `cordis.patch.yml` row; this README f
 Makes an agent *remember what recent sessions talked about* when a new session starts.
 
 - **Capture** — captures `session/event → turn/end` only when `reason.kind === 'completed'`, once per live session turn.
-- **Recall** — on `agent/session-start`, checks existing surface and pending memory before injecting recent digests.
+- **Recall** — on `agent/created` (source `startup`/`clear`), checks claimed and pending memory before injecting recent digests; `resume`/`compact` skip re-injection.
 - **Recover** — restores the accepted current-step messages after compaction, or the rebuilt request during a same-step overflow retry.
 
 Capture is rule-based text extraction: no extra LLM calls. Local file I/O is synchronous; failures are logged. It is not a semantic summarization pipeline.
 
 ### How it works
 
-Four business listeners plus disposal cleanup; no services injected:
+Four business listeners; no services injected (the fake `dispose`-event guard was dropped — Cordis auto-detaches listeners when the fiber unloads):
 
 | Event | Action |
 |---|---|
-| `agent/session-start` | Deduplicate surface/pending memory, then enqueue recall |
-| `session/event` | Capture the committed completed turn, bounded by its event sequence |
+| `agent/created` | On `startup`/`clear`: deduplicate claimed/pending memory, then inject recall (`resume`/`compact` skip) |
+| `session/event` | Accumulate this turn's user/assistant text; capture on `turn/end` when `reason.kind === 'completed'` |
 | `agent/pre-step` | After `next()`, update `decision.messages`, preserve extra fields, settle own pending messages |
 | `agent/request-error` | Outer `prepend` listener: await compaction recovery, append recall only for an uncancelled overflow retry with a newer surface generation |
 
@@ -54,17 +58,14 @@ Session-event shapes are asymmetric (verified against `packages/core/session/src
 ```
 user/message      → data IS the UserMessage        (use data.content, ONLY when data.source.kind === 'user')
 assistant/message → data is {turn, step, message}   (use data.message.content)
-turn/start        → data is {turn}                  (the backward-scan boundary)
+turn/start        → data is {turn}                  (opens a fresh per-turn capture buffer)
 ```
 
-DSH also injects scaffolding — the workspace `AGENTS.md`, runtime-context snapshots, the skills catalog — as `user/message` events, each stamped with its own `source.kind`. Only a genuine user prompt carries `source.kind === 'user'` (the headless bundle and `session-controller` both stamp it so, and DSH's own tests discriminate injected context by `source.kind !== 'user'`). `extractTurn` therefore **whitelists** `kind === 'user'` rather than blacklisting known plugin kinds — the source map is merge-extensible, so a blacklist would leak every newly added injection kind. Without the filter the digest fills with boilerplate that is then re-injected as "background" and amplified each session.
+DSH also injects scaffolding — the workspace `AGENTS.md`, runtime-context snapshots, the skills catalog — as `user/message` events, each stamped with its own `source.kind`. Only a genuine user prompt carries `source.kind === 'user'` (the headless bundle and `session-controller` both stamp it so, and DSH's own tests discriminate injected context by `source.kind !== 'user'`). Capture (`turnTextOf`) therefore **whitelists** `kind === 'user'` rather than blacklisting known plugin kinds — the source map is merge-extensible, so a blacklist would leak every newly added injection kind. Without the filter the digest fills with boilerplate that is then re-injected as "background" and amplified each session.
 
 `session.append` only checks JSON round-trip safety, not a strict per-field schema — so an inlined frozen literal with a fresh `randomUUID()` injects exactly like `llm.createUserMessage()`, with no import of DSH internals.
 
 ### Install
-
-> The package `name` is `dsh-memory-plugin`, so `dsh plugin add github:YaoQC-Ai/dsh-memory-plugin`
-> resolves the three plugin rows that reference `dsh-memory-plugin[/save|/timer]`.
 
 From a git host (pnpm links the checkout; nothing is built):
 
@@ -84,6 +85,8 @@ Verify the layer, then start:
 dsh --profile <name> --dump-config   # shows a "# == dsh-memory-plugin" layer
 dsh --profile <name>
 ```
+
+The package declares `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`. On an incompatible host, `dsh` skips this bundle at boot with a stderr warning (its three plugin rows vanish from `--dump-config`) instead of failing every turn mid-conversation.
 
 ### Configuration
 
@@ -143,11 +146,11 @@ This exposes `mcp__memorix__*` tools the model can call natively.
 
 ```sh
 npm test
-# Optional: DSH_SOURCE must point to a built 0.1.5-rc.2 source tree.
+# Optional: DSH_SOURCE must point to a built 0.2.0-rc.1 source tree (override the expected version with DSH_EXPECTED_VERSION).
 npm run test:host
 ```
 
-The 38 unit tests require no host dependencies. The optional integration harness uses real host drivers with a simulated provider, temporary storage and no network. Tests are included in Git, not in the npm runtime package.
+The 41 unit tests require no host dependencies. The optional integration harness uses real host drivers with a simulated provider, temporary storage and no network. Tests are included in Git, not in the npm runtime package.
 
 ### License
 
@@ -162,19 +165,19 @@ MIT
 让 agent 在新会话开始时「记得」最近若干会话聊过什么。
 
 - **捕获** —— `session/event → turn/end` 且 `reason.kind === 'completed'` 时，按轮次提取 user + assistant 文本，写入会话摘要。
-- **召回** —— `agent/session-start` 检查 surface 与 pending 中是否已有记忆，再注入近期摘要。
+- **召回** —— `agent/created`（source 为 `startup`/`clear`）检查已认领与 pending 中是否已有记忆，再注入近期摘要；`resume`/`compact` 不重复注入。
 - **恢复** —— 压缩后修正当前步最终消息；溢出压缩后，在同一步重试重建请求前恢复记忆。
 
 捕获是规则化文本提取，不增加模型调用；本地文件 I/O 是同步的，失败记告警。它不是语义摘要流水线。
 
 ### 工作原理
 
-四个业务监听器及一个卸载清理监听器，不注入服务：
+四个业务监听器，不注入服务（已去掉那个挂在不存在事件上的 `dispose` 守卫 —— Cordis 会在 fiber 卸载时自动摘除监听器）：
 
 | 事件 | 动作 |
 |---|---|
-| `agent/session-start` | 检查已有记忆，必要时排队召回 |
-| `session/event` | 只捕获已提交的 completed 轮次，用 event.seq 限定快照上界 |
+| `agent/created` | `startup`/`clear` 时检查已有记忆，必要时注入召回（`resume`/`compact` 跳过） |
+| `session/event` | 增量累积本轮 user/assistant 文本，`turn/end` 且 `reason.kind === 'completed'` 时落盘 |
 | `agent/pre-step` | `await next()` 后修正 `decision.messages`，保留扩展字段，清理本插件 pending |
 | `agent/request-error` | `prepend` 外层等待压缩器恢复；仅在溢出 retry、未取消且 surface generation 增加时追加记忆日志 |
 
@@ -185,17 +188,14 @@ MIT
 ```
 user/message      → data 本身就是 UserMessage     （取 data.content，且仅当 data.source.kind === 'user'）
 assistant/message → data 是 {turn, step, message}  （取 data.message.content）
-turn/start        → data 是 {turn}                 （反向扫描的边界）
+turn/start        → data 是 {turn}                 （开启本轮捕获缓冲）
 ```
 
-DSH 还会把工作区 `AGENTS.md`、runtime-context 快照、skills 目录这些脚手架也作为 `user/message` 事件注入，各自带着不同的 `source.kind`。唯有真实用户 prompt 才是 `source.kind === 'user'`（headless bundle 与 `session-controller` 都如此打标，DSH 自身测试也用 `source.kind !== 'user'` 区分注入上下文）。因此 `extractTurn` 采用**白名单** `kind === 'user'`，而非黑名单已知插件 kind——source map 可被插件扩展，黑名单会漏掉每一种新增的注入 kind。不加这道过滤，digest 会被样板塞满，再作为「背景」注入下一会话，逐次放大。
+DSH 还会把工作区 `AGENTS.md`、runtime-context 快照、skills 目录这些脚手架也作为 `user/message` 事件注入，各自带着不同的 `source.kind`。唯有真实用户 prompt 才是 `source.kind === 'user'`（headless bundle 与 `session-controller` 都如此打标，DSH 自身测试也用 `source.kind !== 'user'` 区分注入上下文）。因此捕获过滤（`turnTextOf`）采用**白名单** `kind === 'user'`，而非黑名单已知插件 kind——source map 可被插件扩展，黑名单会漏掉每一种新增的注入 kind。不加这道过滤，digest 会被样板塞满，再作为「背景」注入下一会话，逐次放大。
 
 `session.append` 只校验 JSON 无损可序列化，不做逐字段严格 schema 校验 —— 所以内联一个带新 `randomUUID()` 的冻结字面量，注入效果与 `llm.createUserMessage()` 完全一致，且无需 import 任何 DSH 内部模块。
 
 ### 安装
-
-> 包 `name` 是 `dsh-memory-plugin`，所以 `dsh plugin add github:YaoQC-Ai/dsh-memory-plugin`
-> 能解析引用 `dsh-memory-plugin[/save|/timer]` 的三行插件。
 
 从 git 托管安装（pnpm 链接该 checkout，不跑任何构建）：
 
@@ -215,6 +215,8 @@ dsh plugin --profile <name> add ./dsh-memory-plugin
 dsh --profile <name> --dump-config   # 会显示一层 "# == dsh-memory-plugin"
 dsh --profile <name>
 ```
+
+本包声明 `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`。宿主不兼容时，`dsh` 会在 boot 期跳过本组合包并往 stderr 打警告（`--dump-config` 里三行插件消失），而不是让每个回合在对话中途失败。
 
 ### 配置
 
@@ -302,7 +304,7 @@ L1 提供的是「近期性」，不做语义检索。要语义召回，请把�
 npm test
 ```
 
-38 项单测无需宿主依赖。可选真实宿主集成测试使用已构建的 0.1.5-rc.2 源码、真实驱动与压缩器、模拟提供方和临时目录，不访问网络：
+41 项单测无需宿主依赖。可选真实宿主集成测试使用已构建的 0.2.0-rc.1 源码（期望版本可用 `DSH_EXPECTED_VERSION` 覆盖）、真实驱动与压缩器、模拟提供方和临时目录，不访问网络：
 
 ```powershell
 $env:DSH_SOURCE = '<已构建的宿主源码绝对路径>'

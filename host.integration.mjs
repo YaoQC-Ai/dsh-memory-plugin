@@ -1,4 +1,4 @@
-/** 可选宿主集成：DSH_SOURCE 指向已构建的 0.1.5-rc.2 源码树，零网络、隔离目录。 */
+/** 可选宿主集成：DSH_SOURCE 指向已构建的宿主源码树（期望版本取 DSH_EXPECTED_VERSION，默认 0.2.0-rc.1），零网络、隔离目录。 */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -10,7 +10,9 @@ import * as timer from './timer.js'
 
 const host = process.env.DSH_SOURCE
 assert.ok(host, '请设置 DSH_SOURCE（已构建宿主源码目录）')
-assert.equal(JSON.parse(fs.readFileSync(path.join(host, 'package.json'))).version, '0.1.5-rc.2')
+const expectedVersion = process.env.DSH_EXPECTED_VERSION || '0.2.0-rc.1'
+const hostVersion = JSON.parse(fs.readFileSync(path.join(host, 'package.json'))).version
+assert.equal(hostVersion, expectedVersion, `宿主版本 ${hostVersion} ≠ 期望 ${expectedVersion}（设 DSH_EXPECTED_VERSION 覆盖）`)
 const load = (relative) => import(pathToFileURL(path.join(host, relative, 'lib/index.js')).href)
 const { Context } = await load('vendor/cordis')
 const { mountAgentLoopTestDependencies } = await load('packages/test-support/agent-loop-testkit')
@@ -26,7 +28,9 @@ const root = path.join(dir, 'memory/shortterm')
 fs.mkdirSync(root, { recursive: true })
 fs.writeFileSync(path.join(root, 'history.md'), '唯一集成召回标记')
 const user = (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
-const hasMemory = (request) => request.messages.some((m) => m.source?.plugin === memory.name)
+// 0.2 注入行的 source 是 { kind: 'plugin:memory-shortterm', form: 'recall' }，已无 source.plugin 字段。
+const isMemoryMsg = (m) => m.source?.kind === memory.MEMORY_SOURCE_KIND
+const hasMemory = (request) => request.messages.some(isMemoryMsg)
 const report = []
 
 class Adapter extends LlmAdapter {
@@ -77,7 +81,7 @@ async function harness(auto) {
   await ctx.plugin(Timer)
   const adapter = new Adapter()
   ctx.llm.registerAdapter(['mock'], adapter)
-  const compactFiber = ctx.plugin(BasicCompactionEngine, { auto, thresholdRatio: 0.8, retainTokens: 50, maxTokens: 64, compactionRetries: 0, maxOverflowRetries: 1 })
+  const compactFiber = ctx.plugin(BasicCompactionEngine, { auto, headroomTokens: 0, thresholdRatio: 0.8, retainTokens: 50, maxTokens: 64, compactionRetries: 0, maxOverflowRetries: 1 })
   await compactFiber
   const memFiber = ctx.plugin(memory, { dir })
   await memFiber
@@ -135,13 +139,18 @@ try {
   const b = await h.ctx.agentLoop.create(SessionId('recall-b'), { provider: 'mock', model: 'mock' })
   await send(b, '确认召回')
   assert.ok(JSON.stringify(h.adapter.requests.at(-1)).includes('跨会话测试事实'))
-  // seed/resume 不重放完成事件，也不重复注入。
+  // 0.2：seeded create 的 source 是 'startup'（runtime-types.ts:124「seeded creates are startup」），不是 'resume'，
+  // 故按新会话注入一次召回；seed 不重放 turn/end，b 的完成轮次不会二次捕获。P2-1 后 memoryPresent 只认
+  // 自有状态（claimed / inbox / 本会话注入 seq），不再回扫 surface 内容（eventAt 已废弃），所以父会话 seed
+  // 里的历史注入不参与去重——seeded/fork 会话可能同时带「父注入 + 本次召回」两条 L1 块（有界、非递归放大）；
+  // 真正的 resume（持久化加载）走 source='resume'，在 agent/created 处直接跳过，不产生该重复。
   const { agent: resumed } = await h.ctx.agentLoop.createAgent(h.ctx, {
     sessionId: SessionId('resumed'), seed: b.session.snapshotEvents(), agentOptions: { provider: 'mock', model: 'mock' },
   })
-  assert.equal(resumed.inbox.nextStep.filter((m) => m.source.plugin === memory.name).length, 0)
+  assert.ok(resumed.inbox.nextStep.some(isMemoryMsg), 'seeded startup 应注入一次召回')
   await send(resumed, '恢复')
-  assert.equal(h.adapter.requests.at(-1).messages.filter((m) => m.source?.plugin === memory.name).length, 1)
+  assert.ok(h.adapter.requests.at(-1).messages.some(isMemoryMsg), 'seeded 会话请求应携带记忆')
+  assert.equal(memory.splitEntries(fs.readFileSync(path.join(root, 'resumed.md'), 'utf8')).length, 1, 'seed 不重放完成事件：resumed 只捕获本次恢复轮')
   // 真实 effect 卸载再加载；重复工具注册会由宿主抛错。
   await h.memFiber.dispose()
   await h.ctx.plugin(memory, { dir })
@@ -155,8 +164,8 @@ try {
   await h.ctx.plugin(timer, { dir, pollMs: 10 })
   const after = await h.ctx.agentLoop.create(SessionId('after-reload'), { provider: 'mock', model: 'mock' })
   await send(after, '重载后')
-  assert.equal(h.adapter.requests.at(-1).messages.filter((m) => m.source?.plugin === memory.name).length, 1)
+  assert.equal(h.adapter.requests.at(-1).messages.filter(isMemoryMsg).length, 1)
   assert.equal(memory.splitEntries(fs.readFileSync(path.join(root, 'after-reload.md'), 'utf8')).length, 1)
-  report.push({ capture: 'extended-once', recall: 'first-request', resume: 'dedup', reload: 'ok', memorix: 'absent' })
+  report.push({ capture: 'extended-once', recall: 'first-request', seededStartup: 'recall-injected', reload: 'ok', memorix: 'absent' })
 } finally { await h.ctx.fiber.dispose() }
-console.log(JSON.stringify({ host: '0.1.5-rc.2', isolated: true, report }, null, 2))
+console.log(JSON.stringify({ host: hostVersion, isolated: true, report }, null, 2))
