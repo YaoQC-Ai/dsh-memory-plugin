@@ -1,6 +1,13 @@
 # dsh-memory-plugin
 
-> v0.2.0：面向 DSH **≥0.2.0**（在 **0.2.0-rc.1**、Node.js 24 验证）；不等于已验证所有 DSH 版本。0.1.x 旧宿主不再支持。
+> v0.2.2：面向 DSH **≥0.2.0**（在 **0.2.0-rc.1**、**0.2.0-rc.2** 与 **0.2.1-rc.2**、Node.js 24 验证）；不等于已验证所有 DSH 版本。0.1.x 旧宿主不再支持。
+
+> 0.2.2: re-verified against DSH **0.2.1-rc.2** — runtime files byte-identical to 0.2.0/0.2.1. Diffed every host API the plugin touches (`agent/created`, `session/event` shapes, `append(…,{surfaceOp})`, `pre-step` waterfall, `surface`, V4 admission, `form:'recall'`): all unchanged; `SESSION_FORMAT_VERSION` stays 4. The boot gate evaluates `engines.dsh` with `includePrerelease`, so `>=0.2.0-rc.1 <0.3.0-0` already admits 0.2.1-rc.2. Host harness default moves to `0.2.1-rc.2`. The experimental `appendPluginRecord` API is gated to `packages/experimental/` callers only and is intentionally not adopted.
+> 0.2.2：针对 DSH **0.2.1-rc.2** 重新核验——运行件与 0.2.0/0.2.1 逐字节相同。逐文件比对了插件依赖的每个宿主 API（`agent/created`、`session/event` 形状、`append(…,{surfaceOp})`、`pre-step` waterfall、`surface`、V4 admission、`form:'recall'`）：全部未变；`SESSION_FORMAT_VERSION` 仍为 4（无 v4→v5 迁移）。boot 闸门用 `includePrerelease` 评估 `engines.dsh`，故现有 `>=0.2.0-rc.1 <0.3.0-0` 已放行 0.2.1-rc.2。可选宿主集成默认期望版本改为 `0.2.1-rc.2`。实验性 `appendPluginRecord`/`pluginRecordOf` 仅限 `packages/experimental/` 调用，本插件有意不采用。
+
+> 0.2.1: declarations and verification only — no behavior change. The optional host harness now defaults to `0.2.0-rc.2`, and `package.json` gains a forward-looking `engines.dsh` range (`>=0.2.0-rc.1 <0.3.0-0`) because DSH 0.2.1-alpha.4+ reads `engines.dsh` first and falls back to `peerDependencies`.
+> 0.2.1：只补声明与验证，行为不变。可选宿主集成默认期望版本改为 `0.2.0-rc.2`；`package.json` 新增前瞻性的 `engines.dsh`（`>=0.2.0-rc.1 <0.3.0-0`），因为 DSH 0.2.1-alpha.4 起优先读 `engines.dsh`、其次才回退 `peerDependencies`。
+
 
 > 0.2.0: recall injection moved off the removed `agent/session-start` onto `agent/created` (injecting only on `source: startup | clear`, and carrying `source.form: 'recall'` for the UI's context-recall rendering); capture now accumulates per-turn text from `session/event` instead of the deprecated `snapshotEvents()`/`eventAt()` reads; and a `peerDependencies` gate on `@deepseek-ai/dsh ^0.2.0-rc.1` makes an incompatible host skip this bundle at boot instead of failing every turn mid-conversation. The producer-owned `plugin:memory-shortterm` source kind and recognition of pre-0.2 rows are unchanged.
 
@@ -86,7 +93,7 @@ dsh --profile <name> --dump-config   # shows a "# == dsh-memory-plugin" layer
 dsh --profile <name>
 ```
 
-The package declares `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`. On an incompatible host, `dsh` skips this bundle at boot with a stderr warning (its three plugin rows vanish from `--dump-config`) instead of failing every turn mid-conversation.
+The package declares `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`. On an incompatible host, `dsh` skips this bundle at boot with a stderr warning (its three plugin rows vanish from `--dump-config`) instead of failing every turn mid-conversation. The package also declares `engines.dsh: ">=0.2.0-rc.1 <0.3.0-0"`; hosts from 0.2.1-alpha.4 check that field before the peer range, so the same gate keeps working there.
 
 ### Configuration
 
@@ -146,7 +153,7 @@ This exposes `mcp__memorix__*` tools the model can call natively.
 
 ```sh
 npm test
-# Optional: DSH_SOURCE must point to a built 0.2.0-rc.1 source tree (override the expected version with DSH_EXPECTED_VERSION).
+# Optional: DSH_SOURCE must point to a built 0.2.1-rc.2 source tree (override the expected version with DSH_EXPECTED_VERSION).
 npm run test:host
 ```
 
@@ -216,7 +223,7 @@ dsh --profile <name> --dump-config   # 会显示一层 "# == dsh-memory-plugin"
 dsh --profile <name>
 ```
 
-本包声明 `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`。宿主不兼容时，`dsh` 会在 boot 期跳过本组合包并往 stderr 打警告（`--dump-config` 里三行插件消失），而不是让每个回合在对话中途失败。
+本包声明 `peerDependencies: { "@deepseek-ai/dsh": "^0.2.0-rc.1" }`。宿主不兼容时，`dsh` 会在 boot 期跳过本组合包并往 stderr 打警告（`--dump-config` 里三行插件消失），而不是让每个回合在对话中途失败。本包同时声明 `engines.dsh: ">=0.2.0-rc.1 <0.3.0-0"`；0.2.1-alpha.4 起的宿主先查这个字段、再回退 peer 范围，因此同一道闸门在新宿主上依然生效。
 
 ### 配置
 
@@ -304,7 +311,7 @@ L1 提供的是「近期性」，不做语义检索。要语义召回，请把�
 npm test
 ```
 
-41 项单测无需宿主依赖。可选真实宿主集成测试使用已构建的 0.2.0-rc.1 源码（期望版本可用 `DSH_EXPECTED_VERSION` 覆盖）、真实驱动与压缩器、模拟提供方和临时目录，不访问网络：
+41 项单测无需宿主依赖。可选真实宿主集成测试使用已构建的 0.2.1-rc.2 源码（期望版本可用 DSH_EXPECTED_VERSION 覆盖）、真实驱动与压缩器、模拟提供方和临时目录，不访问网络：
 
 ```powershell
 $env:DSH_SOURCE = '<已构建的宿主源码绝对路径>'

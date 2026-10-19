@@ -1,4 +1,4 @@
-/** 可选宿主集成：DSH_SOURCE 指向已构建的宿主源码树（期望版本取 DSH_EXPECTED_VERSION，默认 0.2.0-rc.1），零网络、隔离目录。 */
+/** 可选宿主集成：DSH_SOURCE 指向已构建的宿主源码树（期望版本取 DSH_EXPECTED_VERSION，默认 0.2.1-rc.2），零网络、隔离目录。 */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -10,7 +10,7 @@ import * as timer from './timer.js'
 
 const host = process.env.DSH_SOURCE
 assert.ok(host, '请设置 DSH_SOURCE（已构建宿主源码目录）')
-const expectedVersion = process.env.DSH_EXPECTED_VERSION || '0.2.0-rc.1'
+const expectedVersion = process.env.DSH_EXPECTED_VERSION || '0.2.1-rc.2'
 const hostVersion = JSON.parse(fs.readFileSync(path.join(host, 'package.json'))).version
 assert.equal(hostVersion, expectedVersion, `宿主版本 ${hostVersion} ≠ 期望 ${expectedVersion}（设 DSH_EXPECTED_VERSION 覆盖）`)
 const load = (relative) => import(pathToFileURL(path.join(host, relative, 'lib/index.js')).href)
